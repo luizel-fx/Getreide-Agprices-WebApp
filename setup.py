@@ -51,6 +51,7 @@ def futures_database_creation():
     cur.execute(f"CREATE TABLE IF NOT EXISTS BR_DI1({macro_tables_colnames})")
     cur.execute(f"CREATE TABLE IF NOT EXISTS BR_DOL({macro_tables_colnames})")
 
+    cur.close()
 
 def market_year_flag(exp_year, exp_month):
     """
@@ -118,34 +119,91 @@ def scrap_tw(asset_name: str, expire_months: list, init_year: int, period: int, 
                 market-year: str.
 
     """
-    df_aux = pd.DataFrame()
+    dfs = []
     for i in range(lookback):
         for m in expire_months:
-            df = load_asset_price(f'{asset_name}{m}{init_year-i}', period)
-            df['time'] = df['time'].dt.tz_convert('America/Sao_Paulo')
-            df['time'] = df['time'].apply(lambda x: datetime(x.year, x.month, x.day))
+            ticker = f'{asset_name}{m}{init_year-i}'
+            try:
+                df = load_asset_price(ticker, period, 'D')
+                if df.empty:
+                    return print(f"No data for {ticker}")
+                    continue
+                
+                df['time'] = df['time'].dt.tz_convert('America/Sao_Paulo')
+                df['time'] = df['time'].apply(lambda x: datetime(x.year, x.month, x.day))
 
-            df['exp_month'] = m
-            df['expire_year'] = init_year - i
+                df['exp_month'] = m
+                df['exp_year'] = init_year - i
 
-            if asset_name in ['ZC', 'CCM', 'ZS', 'ZL', 'ZM']: df['market-year'] = market_year_flag(init_year - 1, m)
+                if asset_name in ['ZC', 'CCM', 'ZS', 'ZL', 'ZM']:
+                    df['market_year'] = market_year_flag(init_year - i, m)
 
-            df = pd.concat([df, df_aux])
-    return
+                dfs.append(df)
+            
+            except Exception as e:
+                print(f"Error scrapping data for {ticker}.")
+                continue
+    
+    scrap = pd.concat(dfs)
+    common_cols = ['time', 'exp_month', 'exp_year', 'open', 'high', 'low', 'close']
+    if asset_name in ['ZC', 'CCM', 'ZS', 'ZL', 'ZM']:
+        return scrap[common_cols + ['market_year']]
+    else:
+        return scrap[common_cols]
 
 def download_futures_prices():
-    CBOT_Corn = 'ZC'
-    CBOT_Corn_Exp = ['H', 'K', 'N', 'U', 'Z']
+    # Standard variables
+    INIT_YEAR = datetime.now().year+1
+    PERIOD = 10_000
+    LOOKBACK = 10
 
-    B3_Corn = 'CCM'
-    B3_Corn_Exp = ['F','H', 'K', 'N', 'U', 'X']
+    con = sqlite3.connect('futures.db')
 
-    CBOT_Soybeans = 'ZS'
-    CBOT_Soybeans_Exp = ['F', 'H', 'K', 'N', 'Q', 'U', 'X']
+    assets_expire_months = {
+        # AGRICULTURAL DATA
+            # Corn
+        'ZC': [['H', 'K', 'N', 'U', 'Z'], "CBOT_corn"],
+        'CCM': [['F','H', 'K', 'N', 'U', 'X'], "B3_corn"],
 
-    CBOT_Soybeans_oil = 'ZL'
-    CBOT_Soybeans_meal = 'ZM'
-    CBOT_Soybeans_oil_Exp = CBOT_Soybeans_meal_Exp = ['F', 'H', 'K', 'N', 'Q', 'U', 'V', 'Z']
+            # Soybeans and related
+        'ZS': [['F', 'H', 'K', 'N', 'Q', 'U', 'X'], "CBOT_soybeans"],
+        'ZL': [['F', 'H', 'K', 'N', 'Q', 'U', 'V', 'Z'], "CBOT_soybean_oil"],
+        'ZM': [['F', 'H', 'K', 'N', 'Q', 'U', 'V', 'Z'], "CBOT_soybeans_meal"],
 
+        # MACRO DATA
+            # Brazil
+        'DOL': [['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z'], 'BR_DOL'],
+        'DI1': [['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z'], 'BR_DI1'],
 
-futures_database_creation()
+            # United States
+        'DX': [['H', 'M', 'U', 'Z'], 'US_DXY'],
+        'SF1': [['F', 'G', 'H', 'J', 'K', 'M', 'N', 'Q', 'U', 'V', 'X', 'Z'], 'US_SOFR']
+    }
+
+    for asset in assets_expire_months.keys():
+        exp_months = assets_expire_months[asset][0]
+        table_name = assets_expire_months[asset][1]
+
+        try: 
+            scrapped_data = scrap_tw(
+                asset,
+                exp_months,
+                INIT_YEAR,
+                PERIOD,
+                LOOKBACK
+            )
+        except Exception as e:
+            print(f"Unexpected error ocurre while scrapping {asset}: {e}")
+
+        try: 
+            scrapped_data.to_sql(table_name, con, if_exists='append', index = False)
+            print(f"Successfully inserted {len(scrapped_data)} records into {table_name}.")
+        except Exception as e:
+            print(f"An unexpected error occurred during DB insertion for {table_name}: {e}")
+
+if __name__ == '__main__':
+    # 1. Ensure the database structure exists
+    futures_database_creation()
+    
+    # 2. Download and insert the data
+    download_futures_prices()
